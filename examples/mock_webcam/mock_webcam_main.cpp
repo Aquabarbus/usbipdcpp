@@ -16,6 +16,7 @@
 #include "usbipdcpp/Device.h"
 #include "usbipdcpp/Server.h"
 #include "usbipdcpp/usbipdcpp_core.h"
+#include "usbipdcpp/virtual_device/SimpleVirtualDeviceHandler.h"
 #include "usbipdcpp/virtual_device/UacConstants.h"
 #include "usbipdcpp/virtual_device/UacVirtualInterfaceHandler.h"
 #include "usbipdcpp/virtual_device/UvcConstants.h"
@@ -31,6 +32,22 @@
 #endif
 
 using namespace usbipdcpp;
+
+/// C920 风格字符串索引（对齐 Logitech C920 实机描述符）：
+/// iManufacturer=0、iProduct=2、iSerialNumber=1、iConfiguration=0
+class C920DeviceHandler : public SimpleVirtualDeviceHandler {
+public:
+    C920DeviceHandler(UsbDevice &handle_device, StringPool &string_pool) :
+        SimpleVirtualDeviceHandler(handle_device, string_pool) {
+        string_pool.remove_string(string_configuration_value);
+        string_pool.remove_string(string_manufacturer_value);
+        string_pool.remove_string(string_product_value);
+        string_configuration_value = 0;
+        string_manufacturer_value = 0;
+        string_serial_value = string_pool.new_string(L"0C920001"); // 测试序列号（8 位十六进制，同实机格式）
+        string_product_value = string_pool.new_string(L"HD Pro Webcam C920");
+    }
+};
 
 /// 解析逗号分隔的采样率列表，如 "48000,16000,8000"
 static std::vector<std::uint32_t> parse_sample_rates(const std::string &str) {
@@ -224,11 +241,11 @@ int main(int argc, char **argv) {
             UsbInterface{
                     .interface_class = CC_VIDEO,
                     .interface_subclass = SC_VIDEOCONTROL,
-                    .interface_protocol = PC_PROTOCOL_15,
+                    .interface_protocol = PC_PROTOCOL_UNDEFINED, // UVC 1.0（C920）
                     .endpoints = {{UsbEndpoint{
-                            .address = 0x87, // IN, endpoint 7 — interrupt for status
+                            .address = 0x83, // IN, endpoint 3 — interrupt for status（C920）
                             .attributes = 0x03, // Interrupt
-                            .max_packet_size = 16,
+                            .max_packet_size = 64,
                             .interval = 8,
                     }}},
             },
@@ -236,7 +253,7 @@ int main(int argc, char **argv) {
             UsbInterface{
                     .interface_class = CC_VIDEO,
                     .interface_subclass = SC_VIDEOSTREAMING,
-                    .interface_protocol = PC_PROTOCOL_15,
+                    .interface_protocol = PC_PROTOCOL_UNDEFINED, // UVC 1.0（C920）
                     .endpoints = {{}, // alt 0: zero bandwidth
                                   {UsbEndpoint{
                                           .address = 0x81, // IN, endpoint 1
@@ -253,7 +270,7 @@ int main(int argc, char **argv) {
                     .interface_subclass = SC_AUDIOCONTROL,
                     .interface_protocol = 0x00,
                     .endpoints = {{UsbEndpoint{
-                            .address = 0x82, // IN, endpoint 2 — interrupt for status
+                            .address = 0x84, // IN, endpoint 4 — interrupt for status（C920 的 AC 无端点）
                             .attributes = 0x03, // Interrupt
                             .max_packet_size = 2, // UAC1 状态字（bStatusType + bOriginator）
                             .interval = 4,
@@ -266,7 +283,7 @@ int main(int argc, char **argv) {
                     .interface_protocol = 0x00,
                     .endpoints = {{}, // alt 0: zero bandwidth
                                   {UsbEndpoint{
-                                          .address = 0x83, // IN, endpoint 3（0x81 被 UVC VS 占用）
+                                          .address = 0x82, // IN, endpoint 2（C920）
                                           .attributes = static_cast<std::uint8_t>(EndpointAttributes::Isochronous) |
                                                         static_cast<std::uint8_t>(IsoSyncType::Async),
                                           .max_packet_size = iso_packet_size,
@@ -276,14 +293,14 @@ int main(int argc, char **argv) {
     };
 
     auto device = std::make_shared<UsbDevice>(UsbDevice{
-            .path = "/usbipdcpp/mock_webcam",
+            .path = "/usbipdcpp/c920",
             .busid = busid,
             .bus_num = 1,
             .dev_num = 1,
             .speed = static_cast<std::uint32_t>(UsbSpeed::High),
-            .vendor_id = 0x1234,
-            .product_id = 0x5685,
-            .device_bcd = 0x0100,
+            .vendor_id = 0x046D, // Logitech
+            .product_id = 0x082D, // HD Pro Webcam C920
+            .device_bcd = 0x0011,
             .device_class = 0xEF, // Miscellaneous (IAD)
             .device_subclass = 0x02, // Common Class
             .device_protocol = 0x01, // Interface Association Descriptor
@@ -296,6 +313,8 @@ int main(int argc, char **argv) {
 
     // 接口从 0 连续编号：按下标依次填 interface_number（bInterfaceNumber/IAD 依赖它）
     device->assign_interface_numbers();
+    // 先建设备 handler：C920 字符串索引（1=序列号、2=产品名）先于接口字符串分配
+    device->with_handler<C920DeviceHandler>(string_pool);
     // 先 UVC 后 UAC：UAC helper 会把设备级调度器打开（等时按帧节奏延迟响应），
     // UVC 等时 URB 不走调度器（立即响应，见 UvcDeviceHelper::setup 注释），互不影响
     if (auto ec = UvcDeviceHelper::setup(device, 0, string_pool, std::move(video_source)); ec) {
@@ -306,11 +325,15 @@ int main(int argc, char **argv) {
         SPDLOG_ERROR("UAC 功能装配失败：{}", ec.message());
         return 1;
     }
+    std::dynamic_pointer_cast<UvcVideoControlHandler>(device->interfaces[0].handler)->set_uvc_version(UVC_BCD_1_00);
+    // iInterface/iFunction 字符串即 Windows 中功能设备显示名
+    device->interfaces[0].handler->change_string_interface(L"HD Pro Webcam C920");
+    device->interfaces[2].handler->change_string_interface(L"HD Pro Webcam C920");
 
     Server server;
     server.add_device(std::move(device));
 
-    asio::ip::tcp::endpoint endpoint{asio::ip::tcp::v4(), port};
+    asio::ip::tcp::endpoint endpoint{asio::ip::make_address_v4("127.0.0.1"), port};
 
     if (auto ec = server.start(endpoint); ec) {
         SPDLOG_ERROR("服务器启动失败：{}", ec.message());

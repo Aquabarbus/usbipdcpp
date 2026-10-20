@@ -74,12 +74,21 @@ public:
         vs_handler_ = handler;
     }
 
+    /// 设置 VC Header 的 bcdUVC（默认 UVC_BCD_1_50）并重建类描述符。
+    /// UVC 1.0（< UVC_BCD_1_10）时 Processing Unit 按 1.0 布局（bControlSize=2，无 bmVideoStandards）
+    void set_uvc_version(std::uint16_t bcd_uvc) {
+        bcd_uvc_ = bcd_uvc;
+        desc_built_ = false;
+        build_class_descriptor();
+    }
+
 private:
     void build_class_descriptor();
     void send_vc_status(data_type status);
 
     data_type class_desc_;
     bool desc_built_ = false;
+    std::uint16_t bcd_uvc_ = UVC_BCD_1_50;
     bool power_on_ = true;
     UvcVideoStreamingHandler *vs_handler_ = nullptr;
 

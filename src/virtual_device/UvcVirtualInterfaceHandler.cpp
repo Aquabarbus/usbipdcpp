@@ -133,7 +133,7 @@ void UvcVideoControlHandler::build_class_descriptor() {
 
     // VC Header（wTotalLength 占位，构建完成后回填实际总长）
     VcHeaderDesc{VC_HEADER_1ITF_LEN, CS_INTERFACE, VC_DESC_HEADER,
-                 UVC_BCD_1_50, // bcdUVC 0x0150 (UVC 1.5)
+                 bcd_uvc_, // bcdUVC（默认 0x0150 UVC 1.5，见 set_uvc_version）
                  0x00,
                  0x019BFCC0, // dwClockFrequency = 27000000 (27 MHz)
                  0x01, // bInCollection
@@ -154,6 +154,17 @@ void UvcVideoControlHandler::build_class_descriptor() {
             .append_to(d);
 
     // Processing Unit: 13 bytes, bControlSize=3 + bmVideoStandards (UVC 1.5 Table 3-8)
+    if (bcd_uvc_ < UVC_BCD_1_10) {
+        // UVC 1.0 Table 3-8: 11 bytes, bControlSize=2，无 bmVideoStandards
+        d.insert(d.end(), {11, CS_INTERFACE, VC_DESC_PROCESSING_UNIT,
+                           0x02, // bUnitID
+                           0x01, // bSourceID → IT
+                           0x00, 0x00, // wMaxMultiplier
+                           0x02, // bControlSize = 2
+                           0x1F, 0x02, // bmControls[2]: Brightness|Contrast|Hue|Saturation|Sharpness|Gain
+                           0x00}); // iProcessing
+    }
+    else
     VcProcessingUnitDesc{pu_len, CS_INTERFACE, VC_DESC_PROCESSING_UNIT,
                          0x02, // bUnitID
                          0x01, // bSourceID → IT

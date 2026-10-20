@@ -725,7 +725,7 @@ data_type VirtualDeviceHandler::get_device_descriptor(std::uint16_t language_id,
                handle_device.device_class, handle_device.device_subclass, handle_device.device_protocol,
                static_cast<std::uint8_t>(handle_device.ep0_in.max_packet_size), // bMaxPacketSize0
                handle_device.vendor_id, handle_device.product_id,
-               static_cast<std::uint16_t>(handle_device.device_bcd.minor | (handle_device.device_bcd.major << 8)),
+               static_cast<std::uint16_t>(handle_device.device_bcd), // bcdDevice（Version 的 BCD 编码，含 patch 位）
                string_manufacturer_value, string_product_value, string_serial_value, handle_device.num_configurations}
             .append_to(desc);
 

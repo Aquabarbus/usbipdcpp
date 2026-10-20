@@ -26,6 +26,7 @@
 #include "usbipdcpp/virtual_device/video_sources/ColorBarSource.h"
 #ifdef USBIPDCPP_USE_FFMPEG
 #include "AudioVideoFileSource.h"
+#include "IpCameraSource.h"
 #endif
 #ifdef USBIPDCPP_USE_MINIAUDIO
 #include "AudioFileSource.h"
@@ -136,6 +137,9 @@ int main(int argc, char **argv) {
     // cxxopts 按未知选项拒绝
     options_group("video", "Audio+video file for A/V-synchronized output (requires FFmpeg)",
                   cxxopts::value<std::string>());
+    // --url：IP 摄像机流（rtsp://、http:// MJPEG 等）替代彩条，缩放为 --width x --height YUY2
+    options_group("url", "IP camera stream URL (rtsp://, http://...) instead of color bars (requires FFmpeg)",
+                  cxxopts::value<std::string>());
 #endif
 #ifdef USBIPDCPP_USE_MINIAUDIO
     // 仅 miniaudio 可用时注册 --audio：不可用的构建里 -h 不显示该选项，
@@ -210,6 +214,9 @@ int main(int argc, char **argv) {
         video_source = std::make_unique<FfmpegVideoSourceView>(av_state);
         source = std::make_unique<FfmpegAudioSourceView>(av_state);
         av_file_mode = true;
+    } else if (result.count("url") > 0) {
+        video_source = std::make_unique<IpCameraSource>(result["url"].as<std::string>(), width, height, fps);
+        source = create_source(result, rates, harmonics, channels, freq, amp, !clamp);
     } else
 #endif
     {

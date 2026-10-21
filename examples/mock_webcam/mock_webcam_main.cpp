@@ -24,6 +24,7 @@
 #include "usbipdcpp/virtual_device/audio_sources/FourierSource.h"
 #include "usbipdcpp/virtual_device/audio_sources/SineWaveSource.h"
 #include "usbipdcpp/virtual_device/video_sources/ColorBarSource.h"
+#include "StreamAudioBuffer.h"
 #ifdef USBIPDCPP_USE_FFMPEG
 #include "AudioVideoFileSource.h"
 #include "IpCameraSource.h"
@@ -130,7 +131,10 @@ int main(int argc, char **argv) {
          cxxopts::value<std::string>())
         ("clamp", "Clip over-limit samples to full scale instead of scaling the whole "
          "wave down by the peak (default: scale only when peak exceeds full scale)",
-         cxxopts::value<bool>()->default_value("false")->implicit_value("true"));
+         cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
+        ("mic", "Microphone source: sine (synthesized, see --freq/--harmonics/--audio), mute (silence), "
+         "url (audio track of --audio-url or --url, silence while unavailable; requires FFmpeg)",
+         cxxopts::value<std::string>()->default_value("sine"));
 #ifdef USBIPDCPP_USE_FFMPEG
     // 仅 FFmpeg 可用时注册 --video：音画同步模式（视频轨 → UVC、音轨 → UAC，
     // 同一文件同一时间轴）。不可用的构建里 -h 不显示该选项，直接传也会被
@@ -139,6 +143,9 @@ int main(int argc, char **argv) {
                   cxxopts::value<std::string>());
     // --url：IP 摄像机流（rtsp://、http:// MJPEG 等）替代彩条，缩放为 --width x --height YUY2
     options_group("url", "IP camera stream URL (rtsp://, http://...) instead of color bars (requires FFmpeg)",
+                  cxxopts::value<std::string>());
+    // --audio-url：单独的音频流（如 IP Webcam 的 http://host:8080/audio.wav），配合 --mic url
+    options_group("audio-url", "Separate audio stream URL for --mic url (default: audio track of --url)",
                   cxxopts::value<std::string>());
 #endif
 #ifdef USBIPDCPP_USE_MINIAUDIO
@@ -193,6 +200,22 @@ int main(int argc, char **argv) {
         std::cerr << "Harmonics list is empty or malformed, use \"freq:amp[:phase],...\"" << std::endl;
         return 1;
     }
+    auto mic = result["mic"].as<std::string>();
+    if (mic != "sine" && mic != "mute" && mic != "url") {
+        std::cerr << "--mic must be sine, mute or url" << std::endl;
+        return 1;
+    }
+#ifdef USBIPDCPP_USE_FFMPEG
+    if (mic == "url" && result.count("url") == 0 && result.count("audio-url") == 0) {
+        std::cerr << "--mic url needs --url or --audio-url" << std::endl;
+        return 1;
+    }
+#else
+    if (mic == "url") {
+        std::cerr << "--mic url requires an FFmpeg build" << std::endl;
+        return 1;
+    }
+#endif
 
     spdlog::set_level(spdlog::level::trace);
 
@@ -204,7 +227,23 @@ int main(int argc, char **argv) {
     std::unique_ptr<VideoSource> video_source;
     std::unique_ptr<AudioSource> source;
     bool av_file_mode = false;
+    // --mic mute/url：实时缓冲（无生产者即静音），url 模式由流解码线程填充
+    std::shared_ptr<StreamAudioBuffer> stream_audio;
+    if (mic != "sine") {
+        stream_audio = std::make_shared<StreamAudioBuffer>(rates, static_cast<std::uint16_t>(channels));
+    }
+    auto make_mic_source = [&]() -> std::unique_ptr<AudioSource> {
+        if (stream_audio)
+            return std::make_unique<StreamAudioSourceView>(stream_audio);
+        return create_source(result, rates, harmonics, channels, freq, amp, !clamp);
+    };
 #ifdef USBIPDCPP_USE_FFMPEG
+    // --audio-url 单独拉流；否则 --mic url 取 --url 同一条流的音轨
+    std::unique_ptr<IpAudioStream> audio_stream;
+    auto has_audio_url = mic == "url" && result.count("audio-url") > 0;
+    if (has_audio_url) {
+        audio_stream = std::make_unique<IpAudioStream>(result["audio-url"].as<std::string>(), stream_audio);
+    }
     if (has_video) {
         auto av_state = std::make_shared<AudioVideoFileState>(result["video"].as<std::string>(), rates);
         if (!av_state->ok()) {
@@ -215,13 +254,14 @@ int main(int argc, char **argv) {
         source = std::make_unique<FfmpegAudioSourceView>(av_state);
         av_file_mode = true;
     } else if (result.count("url") > 0) {
-        video_source = std::make_unique<IpCameraSource>(result["url"].as<std::string>(), width, height, fps);
-        source = create_source(result, rates, harmonics, channels, freq, amp, !clamp);
+        video_source = std::make_unique<IpCameraSource>(result["url"].as<std::string>(), width, height, fps,
+                                                        mic == "url" && !has_audio_url ? stream_audio : std::shared_ptr<StreamAudioBuffer>{});
+        source = make_mic_source();
     } else
 #endif
     {
         video_source = std::make_unique<ColorBarSource>(width, height, fps);
-        source = create_source(result, rates, harmonics, channels, freq, amp, !clamp);
+        source = make_mic_source();
     }
     // 声道数以音源实际为准
     channels = source->current_format().channels;
@@ -351,6 +391,8 @@ int main(int argc, char **argv) {
     for (auto r: rates)
         rates_str += std::to_string(r) + " ";
     auto mode_str = av_file_mode ? std::string("AV file (A/V synchronized)")
+                                 : mic == "mute" ? std::string("muted")
+                                 : mic == "url" ? std::string("stream audio")
                                  : (has_audio ? std::string("audio file")
                                               : (has_harmonics ? std::string("fourier harmonics")
                                                                : std::to_string(freq) + "Hz sine"));

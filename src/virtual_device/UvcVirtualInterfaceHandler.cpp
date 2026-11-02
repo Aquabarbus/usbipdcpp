@@ -444,10 +444,29 @@ void UvcVideoStreamingHandler::pacer_loop() {
         while (!idle_urbs_.empty() && idle_urbs_.front().due <= now) {
             auto urb = std::move(idle_urbs_.front());
             idle_urbs_.pop_front();
+            stats_.max_overshoot_us = std::max<std::int64_t>(stats_.max_overshoot_us, std::chrono::duration_cast<std::chrono::microseconds>(now - urb.due).count());
             if (responder)
                 responder->submit_ret_submit(fill_iso_locked(urb.seqnum, std::move(urb.transfer)));
         }
     }
+}
+
+void UvcVideoStreamingHandler::maybe_log_stats_locked(std::chrono::steady_clock::time_point now) {
+    if (stats_.since == std::chrono::steady_clock::time_point{}) {
+        stats_.since = now;
+        return;
+    }
+    if (now - stats_.since < std::chrono::seconds(10))
+        return;
+    SPDLOG_INFO("UVC stats 10s: urbs={} idle={} pkts/urb={}..{} max_in_gap={}us max_depth={} max_hold={}us "
+                "max_overshoot={}us frames={} late>5ms={} max_late={}us resyncs={} unlinks={}",
+                stats_.urbs, stats_.idle, stats_.min_pkts, stats_.max_pkts, stats_.max_in_gap_us, stats_.max_depth,
+                stats_.max_hold_us, stats_.max_overshoot_us, stats_.frames, stats_.late_frames, stats_.max_late_us,
+                stats_.resyncs, stats_.unlinks);
+    auto last = stats_.last_urb_at;
+    stats_ = {};
+    stats_.since = now;
+    stats_.last_urb_at = last;
 }
 
 void UvcVideoStreamingHandler::flush_idle_urbs_locked() {
@@ -463,6 +482,7 @@ void UvcVideoStreamingHandler::handle_unlink_seqnum(std::uint32_t unlink_seqnum,
     // RET_UNLINK 由 VC 接口 handler 统一应答（VirtualDeviceHandler 逐接口分发），
     // 这里只把仍在空闲队列里的 URB 立即完成，避免主机等它
     std::lock_guard lock(mutex_);
+    ++stats_.unlinks;
     for (auto it = idle_urbs_.begin(); it != idle_urbs_.end(); ++it) {
         if (it->seqnum == unlink_seqnum) {
             if (responder)
@@ -847,6 +867,13 @@ void UvcVideoStreamingHandler::handle_isochronous_transfer(std::uint32_t seqnum,
     const auto now = std::chrono::steady_clock::now();
     const auto next_frame_at = frame_started_at_ + frame_interval_;
     const bool idle = frame_interval_.count() > 0 && frame_offset_ == 0 && now < next_frame_at;
+    ++stats_.urbs;
+    stats_.min_pkts = std::min(stats_.min_pkts, num_iso_packets);
+    stats_.max_pkts = std::max(stats_.max_pkts, num_iso_packets);
+    if (stats_.last_urb_at != std::chrono::steady_clock::time_point{})
+        stats_.max_in_gap_us = std::max<std::int64_t>(stats_.max_in_gap_us, std::chrono::duration_cast<std::chrono::microseconds>(now - stats_.last_urb_at).count());
+    stats_.last_urb_at = now;
+    maybe_log_stats_locked(now);
     if (idle || !idle_urbs_.empty()) {
         // 帧间空闲（或前面还有排队的空闲 URB，保序）：按本 URB 的总线时长
         // 延迟应答、最晚到下一帧时刻（见 IdleUrb 注释）。帧数据 URB 不受影响，
@@ -857,6 +884,10 @@ void UvcVideoStreamingHandler::handle_isochronous_transfer(std::uint32_t seqnum,
         auto base = idle_urbs_.empty() ? now : std::max(now, idle_urbs_.back().due);
         auto due = idle ? std::min(base + bus_time, next_frame_at) : base;
         idle_urbs_.push_back(IdleUrb{seqnum, std::move(transfer), due});
+        if (idle)
+            ++stats_.idle;
+        stats_.max_depth = std::max(stats_.max_depth, idle_urbs_.size());
+        stats_.max_hold_us = std::max<std::int64_t>(stats_.max_hold_us, std::chrono::duration_cast<std::chrono::microseconds>(due - now).count());
         pacer_cv_.notify_one();
         return;
     }
@@ -906,10 +937,17 @@ UsbIpResponse::UsbIpRetSubmit UvcVideoStreamingHandler::fill_iso_locked(std::uin
         // 零点几毫秒，按实际时刻算会把这点延迟累加进每个帧间隔）；
         // 落后超过一个帧间隔（主机消费慢）才重新对齐到现在
         auto planned = frame_started_at_ + frame_interval_;
-        frame_started_at_ = (frame_started_at_ != std::chrono::steady_clock::time_point{} &&
-                             now - planned < frame_interval_)
-                                    ? planned
-                                    : now;
+        const bool first = frame_started_at_ == std::chrono::steady_clock::time_point{};
+        ++stats_.frames;
+        if (!first) {
+            auto late_us = std::chrono::duration_cast<std::chrono::microseconds>(now - planned).count();
+            stats_.max_late_us = std::max<std::int64_t>(stats_.max_late_us, late_us);
+            if (late_us > 5000)
+                ++stats_.late_frames;
+            if (now - planned >= frame_interval_)
+                ++stats_.resyncs;
+        }
+        frame_started_at_ = (!first && now - planned < frame_interval_) ? planned : now;
     }
 
     std::uint32_t total_sent = 0;

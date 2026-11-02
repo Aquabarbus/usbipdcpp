@@ -177,6 +177,17 @@ private:
     bool pacer_stop_ = false;
     std::thread pacer_;
 
+    // 诊断统计（持 mutex_ 更新，开流期间每 10 秒打印一次并清零）
+    struct Stats {
+        std::chrono::steady_clock::time_point since{};
+        std::chrono::steady_clock::time_point last_urb_at{};
+        std::uint32_t urbs = 0, idle = 0, frames = 0, late_frames = 0, resyncs = 0, unlinks = 0;
+        std::size_t max_depth = 0;
+        int min_pkts = 1 << 30, max_pkts = 0;
+        std::int64_t max_in_gap_us = 0, max_hold_us = 0, max_overshoot_us = 0, max_late_us = 0;
+    } stats_;
+    void maybe_log_stats_locked(std::chrono::steady_clock::time_point now);
+
     // 帧缓冲
     std::vector<std::uint8_t> frame_buffer_;
     std::size_t frame_offset_ = 0;

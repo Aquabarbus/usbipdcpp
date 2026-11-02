@@ -456,9 +456,9 @@ void UvcVideoStreamingHandler::maybe_log_stats_locked(std::chrono::steady_clock:
         stats_.since = now;
         return;
     }
-    if (now - stats_.since < std::chrono::seconds(10))
+    if (now - stats_.since < std::chrono::seconds(60))
         return;
-    SPDLOG_INFO("UVC stats 10s: urbs={} idle={} pkts/urb={}..{} max_in_gap={}us max_depth={} max_hold={}us "
+    SPDLOG_INFO("UVC stats 60s: urbs={} idle={} pkts/urb={}..{} max_in_gap={}us max_depth={} max_hold={}us "
                 "max_overshoot={}us frames={} late>5ms={} max_late={}us resyncs={} unlinks={}",
                 stats_.urbs, stats_.idle, stats_.min_pkts, stats_.max_pkts, stats_.max_in_gap_us, stats_.max_depth,
                 stats_.max_hold_us, stats_.max_overshoot_us, stats_.frames, stats_.late_frames, stats_.max_late_us,

@@ -177,7 +177,7 @@ private:
     bool pacer_stop_ = false;
     std::thread pacer_;
 
-    // 诊断统计（持 mutex_ 更新，开流期间每 10 秒打印一次并清零）
+    // 诊断统计（持 mutex_ 更新，开流期间每 60 秒打印一次并清零）
     struct Stats {
         std::chrono::steady_clock::time_point since{};
         std::chrono::steady_clock::time_point last_urb_at{};

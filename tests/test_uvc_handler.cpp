@@ -4,8 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #include "test_utils.h"
 
@@ -70,6 +73,29 @@ struct StubSource : VideoSource {
     bool fail_next = false;
 };
 
+// 线程安全的应答收集：帧间空闲 URB 由 handler 的节拍线程异步应答
+struct SyncCaptureResponder : CaptureResponder {
+    void submit_ret_submit(UsbIpResponse::UsbIpRetSubmit &&submit) override {
+        {
+            std::lock_guard lock(mutex);
+            CaptureResponder::submit_ret_submit(std::move(submit));
+        }
+        cv.notify_all();
+    }
+    /// 等到至少 n 条 RET_SUBMIT（超时返回 false）
+    bool wait_for_submits(std::size_t n, std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, timeout, [&] { return submits.size() >= n; });
+    }
+    std::size_t submit_count() {
+        std::lock_guard lock(mutex);
+        return submits.size();
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+};
+
 struct UvcTestEnv {
     StringPool pool;
     // 传输分配器：必须声明在 stub 之前（成员逆序析构，op 后死）——
@@ -78,7 +104,7 @@ struct UvcTestEnv {
     UsbInterface intf{.interface_class = 0x0E, .interface_subclass = 0x02, .interface_protocol = 0x00};
     StubSource *source = nullptr;
     UvcVideoStreamingHandler handler{intf, pool, std::unique_ptr<StubSource>()};
-    CaptureResponder stub;
+    SyncCaptureResponder stub;
     usbipdcpp::error_code ec;
 
     explicit UvcTestEnv(std::size_t frame_size = 64) :
@@ -184,18 +210,47 @@ TEST(TestUvcHandler, IsoInServesFrameWithHeaders) {
 
 TEST(TestUvcHandler, FrameIntervalGateEmitsEmptyPacket) {
     // 第一帧传完立即再发 iso IN：帧间隔（33ms）未到 → 空包（actual_length=0），
-    // 避免主机拉得快时快放
+    // 避免主机拉得快时快放。空包不立即应答，按 URB 总线时长（4 包 × 125µs）
+    // 由节拍线程发出，防止主机"完成→重提交"空转
     UvcTestEnv env;
     env.start_streaming();
 
     env.deliver_iso_in(2); // 传完第一帧
+    ASSERT_EQ(env.stub.submit_count(), 2u); // commit ack + 帧数据（立即）
+    const auto sent_at = std::chrono::steady_clock::now();
     env.deliver_iso_in(3); // 立即第二帧：帧间隔未到
 
-    ASSERT_GE(env.stub.submits.size(), 2u);
+    ASSERT_TRUE(env.stub.wait_for_submits(3));
+    const auto elapsed = std::chrono::steady_clock::now() - sent_at;
+    EXPECT_GE(elapsed, std::chrono::microseconds(500)); // 不早于总线时长
+    EXPECT_LT(elapsed, std::chrono::milliseconds(33)); // 不晚于下一帧
     const auto *ret = &env.stub.submits.back();
     ASSERT_EQ(ret->header.seqnum, 3u);
     EXPECT_EQ(ret->status, 0u);
     EXPECT_EQ(ret->actual_length, 0u); // 空包
+}
+
+TEST(TestUvcHandler, IdleUrbsCompleteInOrderAndNextFrameArrives) {
+    // 帧间排队的空闲 URB 按提交顺序完成；到下一帧时刻的 URB 带新帧数据（FID 翻转）
+    UvcTestEnv env;
+    env.start_streaming();
+
+    env.deliver_iso_in(2); // 第一帧（FID=1）
+    std::uint32_t seq = 3;
+    // 持续提交（每次等上一个完成，同主机重提交），直到拿到带数据的 URB
+    for (; seq < 3 + 200; ++seq) {
+        env.deliver_iso_in(seq);
+        ASSERT_TRUE(env.stub.wait_for_submits(seq));
+        if (env.stub.submits.back().actual_length > 0)
+            break;
+    }
+    ASSERT_LT(seq, 3u + 200u);
+    for (std::size_t i = 1; i < env.stub.submits.size(); ++i)
+        EXPECT_EQ(env.stub.submits[i].header.seqnum, i + 1); // 保序
+    // 空闲期 URB 数受总线时长约束：33ms / 0.5ms ≈ 66，远少于立即应答时的空转
+    EXPECT_LE(seq - 3, 80u);
+    auto *trx = GenericTransfer::from_handle(env.stub.submits.back().transfer.get());
+    EXPECT_EQ(trx->data[1] & UVC_PAYLOAD_HEADER_FID, 0); // 第二帧 FID=0
 }
 
 TEST(TestUvcHandler, LargeFrameSpansMultipleUrbs) {

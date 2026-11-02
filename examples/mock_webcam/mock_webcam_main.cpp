@@ -218,6 +218,11 @@ int main(int argc, char **argv) {
 #endif
 
     spdlog::set_level(spdlog::level::trace);
+#ifdef _WIN32
+    // 1ms 系统定时器精度：UVC 帧间空闲包节拍与 UAC 等时调度按毫秒级排期
+    //（默认 15.6ms 会让帧起点与音频包节奏抖动）
+    timeBeginPeriod(1);
+#endif
 
     StringPool string_pool;
 

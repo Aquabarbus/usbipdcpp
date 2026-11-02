@@ -1,8 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <system_error>
 #include <vector>
 
@@ -106,6 +111,7 @@ class USBIPDCPP_API UvcVideoStreamingHandler : public VirtualInterfaceHandler {
 public:
     UvcVideoStreamingHandler(UsbInterface &handle_interface, StringPool &string_pool,
                              std::unique_ptr<VideoSource> source);
+    ~UvcVideoStreamingHandler() override;
 
     [[nodiscard]] data_type get_class_specific_descriptor() override;
     data_type request_get_descriptor(std::uint8_t type, std::uint8_t language_id, std::uint16_t descriptor_length,
@@ -118,6 +124,7 @@ public:
     void handle_isochronous_transfer(std::uint32_t seqnum, const UsbEndpoint &ep, std::uint32_t transfer_flags,
                                      std::uint32_t transfer_buffer_length, TransferHandle transfer, int num_iso_packets,
                                      std::error_code &ec) override;
+    void handle_unlink_seqnum(std::uint32_t unlink_seqnum, std::uint32_t cmd_seqnum) override;
     void on_new_connection(TransferResponder &current_session, error_code &ec) override;
     void on_disconnection(error_code &ec) override;
     void request_set_interface(std::uint16_t alternate_setting, std::uint32_t *p_status) override;
@@ -140,13 +147,35 @@ public:
 private:
     void build_class_descriptor();
 
+    /// 持 mutex_ 调用：按当前帧状态填充一个 ISO URB（帧数据或帧间空包），返回响应
+    UsbIpResponse::UsbIpRetSubmit fill_iso_locked(std::uint32_t seqnum, TransferHandle transfer);
+    /// 持 mutex_ 调用：以 EPIPE 完成所有挂起的空闲 URB（停流）
+    void flush_idle_urbs_locked();
+    /// 空闲 URB 节拍线程：到期按服务时刻的帧状态应答
+    void pacer_loop();
+
     UvcVideoControlHandler *vc_handler_ = nullptr;
 
     std::unique_ptr<VideoSource> source_;
     data_type class_desc_;
     UvcStreamingControl probe_data_{};
-    bool committed_ = false;
-    bool streaming_ = false;
+    std::atomic<bool> committed_{false};
+    std::atomic<bool> streaming_{false};
+
+    // 帧间空闲 URB 节流：真实摄像头一个 URB 的 N 个包占 N 个微帧（N×125µs）才完成，
+    // 虚拟设备若立即回空包，主机"完成→重提交"会空转（实测 800x600@15 时
+    // ~14.5 万 TCP 段/秒、数个 CPU 核）。空闲 URB 在此排队，按总线时长
+    // （最晚到下一帧时刻）由 pacer_ 线程应答；排队期间新到的 URB 跟在后面保序
+    struct IdleUrb {
+        std::uint32_t seqnum;
+        TransferHandle transfer;
+        std::chrono::steady_clock::time_point due;
+    };
+    std::mutex mutex_; // 帧状态 + 空闲队列（网络线程与 pacer_ 线程共享）
+    std::condition_variable pacer_cv_;
+    std::deque<IdleUrb> idle_urbs_;
+    bool pacer_stop_ = false;
+    std::thread pacer_;
 
     // 帧缓冲
     std::vector<std::uint8_t> frame_buffer_;

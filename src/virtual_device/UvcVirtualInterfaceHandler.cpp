@@ -413,6 +413,65 @@ UvcVideoStreamingHandler::UvcVideoStreamingHandler(UsbInterface &handle_interfac
     probe_data_.dwMaxPayloadTransferSize = 512; // wMaxPacketSize of ISO endpoint
     probe_data_.dwFrameInterval = source_->frame_interval();
     frame_interval_ = std::chrono::microseconds(source_->frame_interval() / 10); // 100ns → µs
+    pacer_ = std::thread([this] { pacer_loop(); });
+}
+
+UvcVideoStreamingHandler::~UvcVideoStreamingHandler() {
+    {
+        std::lock_guard lock(mutex_);
+        pacer_stop_ = true;
+    }
+    pacer_cv_.notify_all();
+    if (pacer_.joinable())
+        pacer_.join();
+}
+
+void UvcVideoStreamingHandler::pacer_loop() {
+    std::unique_lock lock(mutex_);
+    while (!pacer_stop_) {
+        if (idle_urbs_.empty()) {
+            pacer_cv_.wait(lock);
+            continue;
+        }
+        auto now = std::chrono::steady_clock::now();
+        // 拷贝出来再等：等待期间队头可能被 UNLINK 移除
+        const auto due = idle_urbs_.front().due;
+        if (now < due) {
+            pacer_cv_.wait_until(lock, due);
+            continue;
+        }
+        // 到期队头依次应答：按服务时刻的帧状态填充，下一帧到点的 URB 直接带帧数据
+        while (!idle_urbs_.empty() && idle_urbs_.front().due <= now) {
+            auto urb = std::move(idle_urbs_.front());
+            idle_urbs_.pop_front();
+            if (responder)
+                responder->submit_ret_submit(fill_iso_locked(urb.seqnum, std::move(urb.transfer)));
+        }
+    }
+}
+
+void UvcVideoStreamingHandler::flush_idle_urbs_locked() {
+    for (auto &urb: idle_urbs_) {
+        if (responder)
+            responder->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(urb.seqnum, 0));
+    }
+    idle_urbs_.clear();
+}
+
+void UvcVideoStreamingHandler::handle_unlink_seqnum(std::uint32_t unlink_seqnum, std::uint32_t cmd_seqnum) {
+    // RET_UNLINK 由 VC 接口 handler 统一应答（VirtualDeviceHandler 逐接口分发），
+    // 这里只把仍在空闲队列里的 URB 立即完成，避免主机等它
+    std::lock_guard lock(mutex_);
+    for (auto it = idle_urbs_.begin(); it != idle_urbs_.end(); ++it) {
+        if (it->seqnum == unlink_seqnum) {
+            if (responder)
+                responder->submit_ret_submit(
+                        UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(unlink_seqnum, 0));
+            idle_urbs_.erase(it);
+            return;
+        }
+    }
 }
 
 void UvcVideoStreamingHandler::on_setup_interface_handlers() {
@@ -757,6 +816,7 @@ void UvcVideoStreamingHandler::handle_non_standard_request_type_control_urb(
             }
         }
         auto fmt = source_->current_format();
+        std::lock_guard lock(mutex_);
         source_->set_format(fmt.fourcc, fmt.width, fmt.height, probe_data_.dwFrameInterval);
         committed_ = true;
         frame_buffer_.resize(source_->max_frame_size());
@@ -783,9 +843,35 @@ void UvcVideoStreamingHandler::handle_isochronous_transfer(std::uint32_t seqnum,
         return;
     }
 
+    std::lock_guard lock(mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    const auto next_frame_at = frame_started_at_ + frame_interval_;
+    const bool idle = frame_interval_.count() > 0 && frame_offset_ == 0 && now < next_frame_at;
+    if (idle || !idle_urbs_.empty()) {
+        // 帧间空闲（或前面还有排队的空闲 URB，保序）：按本 URB 的总线时长
+        // 延迟应答、最晚到下一帧时刻（见 IdleUrb 注释）。帧数据 URB 不受影响，
+        // 仍立即响应
+        auto ep_interval = TransferScheduler::endpoint_interval(
+                ep, device_handler ? device_handler->get_transfer_scheduler().get_speed() : UsbSpeed::High);
+        auto bus_time = ep_interval * std::max(num_iso_packets, 1);
+        auto base = idle_urbs_.empty() ? now : std::max(now, idle_urbs_.back().due);
+        auto due = idle ? std::min(base + bus_time, next_frame_at) : base;
+        idle_urbs_.push_back(IdleUrb{seqnum, std::move(transfer), due});
+        pacer_cv_.notify_one();
+        return;
+    }
+    responder->submit_ret_submit(fill_iso_locked(seqnum, std::move(transfer)));
+}
+
+UsbIpResponse::UsbIpRetSubmit UvcVideoStreamingHandler::fill_iso_locked(std::uint32_t seqnum,
+                                                                       TransferHandle transfer) {
+    if (!streaming_ || !committed_)
+        return UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0);
+
     auto *trx = GenericTransfer::from_handle(transfer.get());
     auto &data = trx->data;
     auto &iso_descs = trx->iso_descriptors;
+    const auto num_iso_packets = static_cast<int>(iso_descs.size());
 
     // 内核 usb_submit_urb 会把 iso_frame_desc[n].status 初始化为 -EXDEV，
     // 必须清零，否则内核 UVC 驱动会跳过所有包。
@@ -804,21 +890,26 @@ void UvcVideoStreamingHandler::handle_isochronous_transfer(std::uint32_t seqnum,
     // （半截帧会被主机驱动标记 corrupted 整帧丢弃，宁慢勿碎）
     const auto now = std::chrono::steady_clock::now();
     if (frame_interval_.count() > 0 && frame_offset_ == 0 && now < frame_started_at_ + frame_interval_) {
-        responder->submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+        return UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
                 seqnum, static_cast<std::uint32_t>(UrbStatusType::StatusOK), 0, 0,
-                static_cast<std::uint32_t>(iso_descs.size()), std::move(transfer)));
-        return;
+                static_cast<std::uint32_t>(iso_descs.size()), std::move(transfer));
     }
 
     if (frame_offset_ == 0) {
         VideoFrame vf{};
         if (!source_->get_frame(vf)) {
-            responder->submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
-            return;
+            return UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0);
         }
         frame_buffer_.assign(vf.data, vf.data + vf.size);
         current_fid_ = !current_fid_;
-        frame_started_at_ = now;
+        // 帧时钟不累积漂移：按计划时刻推进（空闲 URB 节拍让帧起点晚到
+        // 零点几毫秒，按实际时刻算会把这点延迟累加进每个帧间隔）；
+        // 落后超过一个帧间隔（主机消费慢）才重新对齐到现在
+        auto planned = frame_started_at_ + frame_interval_;
+        frame_started_at_ = (frame_started_at_ != std::chrono::steady_clock::time_point{} &&
+                             now - planned < frame_interval_)
+                                    ? planned
+                                    : now;
     }
 
     std::uint32_t total_sent = 0;
@@ -853,16 +944,18 @@ void UvcVideoStreamingHandler::handle_isochronous_transfer(std::uint32_t seqnum,
     if (frame_offset_ >= frame_buffer_.size())
         frame_offset_ = 0;
 
-    // 立即响应（不走 TransferScheduler 的 125µs×包 等时节流）：虚拟设备
+    // 帧数据立即响应（不走 TransferScheduler 的 125µs×包 等时节流）：虚拟设备
     // 没有真实总线，主机拉多快数据就传多快——大帧在帧间隔内传得完才能
-    // 画面流畅。帧时钟已限制帧率上限，不会失控
-    responder->submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+    // 画面流畅。帧时钟已限制帧率上限，帧间空闲 URB 由 pacer_ 节流
+    return UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
             seqnum, static_cast<std::uint32_t>(UrbStatusType::StatusOK), total_sent, 0,
-            static_cast<std::uint32_t>(iso_descs.size()), std::move(transfer)));
+            static_cast<std::uint32_t>(iso_descs.size()), std::move(transfer));
 }
 
 void UvcVideoStreamingHandler::on_new_connection(TransferResponder &current_session, error_code &ec) {
     VirtualInterfaceHandler::on_new_connection(current_session, ec);
+    std::lock_guard lock(mutex_);
+    idle_urbs_.clear();
     committed_ = false;
     streaming_ = false;
     frame_offset_ = 0;
@@ -871,15 +964,22 @@ void UvcVideoStreamingHandler::on_new_connection(TransferResponder &current_sess
 }
 
 void UvcVideoStreamingHandler::on_disconnection(error_code &ec) {
-    streaming_ = false;
-    committed_ = false;
-    frame_started_at_ = {};
+    {
+        // 连接已断：挂起的空闲 URB 丢弃不应答（TransferHandle 析构释放），同 TransferScheduler::stop
+        std::lock_guard lock(mutex_);
+        idle_urbs_.clear();
+        streaming_ = false;
+        committed_ = false;
+        frame_started_at_ = {};
+    }
     VirtualInterfaceHandler::on_disconnection(ec);
 }
 
 void UvcVideoStreamingHandler::request_set_interface(std::uint16_t alternate_setting, std::uint32_t *p_status) {
+    std::lock_guard lock(mutex_);
     if (alternate_setting == 0) {
         streaming_ = false;
+        flush_idle_urbs_locked();
         *p_status = 0;
     }
     else if (alternate_setting == 1) {

@@ -122,6 +122,20 @@ void StreamAudioDecoder::decode(const AVPacket *pkt) {
 
 // ========== IpCameraSource ==========
 
+/// MJPEG 解码出的 yuvj*（已弃用的"全范围"像素格式）换成等价的 yuv* + 全范围标记。
+/// 直接把 yuvj* 交给 sws_getCachedContext 时它每帧都判定参数变了而重建上下文
+///（stderr 每帧一条 deprecated 警告），转换结果本身相同
+static AVPixelFormat strip_jpeg_range(AVPixelFormat fmt, bool &full_range) {
+    switch (fmt) {
+        case AV_PIX_FMT_YUVJ420P: full_range = true; return AV_PIX_FMT_YUV420P;
+        case AV_PIX_FMT_YUVJ422P: full_range = true; return AV_PIX_FMT_YUV422P;
+        case AV_PIX_FMT_YUVJ444P: full_range = true; return AV_PIX_FMT_YUV444P;
+        case AV_PIX_FMT_YUVJ440P: full_range = true; return AV_PIX_FMT_YUV440P;
+        case AV_PIX_FMT_YUVJ411P: full_range = true; return AV_PIX_FMT_YUV411P;
+        default: return fmt;
+    }
+}
+
 IpCameraSource::IpCameraSource(std::string url, std::uint16_t width, std::uint16_t height, std::uint8_t fps,
                                std::shared_ptr<StreamAudioBuffer> audio) :
     url_(std::move(url)), audio_(std::move(audio)), width_(width), height_(height), frame_interval_(10'000'000U / fps) {
@@ -197,6 +211,8 @@ void IpCameraSource::stream_once() {
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frm = av_frame_alloc();
     SwsContext *sws = nullptr;
+    int sws_w = 0, sws_h = 0, sws_fmt = -1;
+    bool sws_full = false;
     std::vector<std::uint8_t> out(static_cast<std::size_t>(width_) * height_ * 2);
     StreamAudioDecoder audio(audio_);
     int stream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
@@ -210,10 +226,24 @@ void IpCameraSource::stream_once() {
         while (!stop_ && av_read_frame(fmt, pkt) >= 0) {
             if (pkt->stream_index == stream && avcodec_send_packet(dec, pkt) >= 0) {
                 while (avcodec_receive_frame(dec, frm) >= 0) {
-                    // 摄像机中途改分辨率/像素格式时 sws_getCachedContext 自动重建
-                    sws = sws_getCachedContext(sws, frm->width, frm->height, static_cast<AVPixelFormat>(frm->format),
-                                               width_, height_, AV_PIX_FMT_YUYV422, SWS_BILINEAR, nullptr, nullptr,
-                                               nullptr);
+                    // 摄像机中途改分辨率/像素格式/范围时重建缩放上下文
+                    bool full = frm->color_range == AVCOL_RANGE_JPEG;
+                    auto src_fmt = strip_jpeg_range(static_cast<AVPixelFormat>(frm->format), full);
+                    if (!sws || frm->width != sws_w || frm->height != sws_h || src_fmt != sws_fmt ||
+                        full != sws_full) {
+                        sws_freeContext(sws);
+                        sws = sws_getContext(frm->width, frm->height, src_fmt, width_, height_, AV_PIX_FMT_YUYV422,
+                                             SWS_BILINEAR, nullptr, nullptr, nullptr);
+                        if (sws) {
+                            // 源按实际范围、输出 YUY2 按 UVC 惯例的有限范围（同原 yuvj 自动转换）
+                            const int *coefs = sws_getCoefficients(SWS_CS_DEFAULT);
+                            sws_setColorspaceDetails(sws, coefs, full ? 1 : 0, coefs, 0, 0, 1 << 16, 1 << 16);
+                        }
+                        sws_w = frm->width;
+                        sws_h = frm->height;
+                        sws_fmt = src_fmt;
+                        sws_full = full;
+                    }
                     if (!sws)
                         continue;
                     std::uint8_t *dst[4] = {out.data(), nullptr, nullptr, nullptr};

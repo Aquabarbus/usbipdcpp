@@ -186,6 +186,11 @@ public:
      */
     static std::chrono::microseconds endpoint_interval(const UsbEndpoint &ep, UsbSpeed speed);
 
+    /// 设备总线速度（构造时传入）
+    UsbSpeed get_speed() const {
+        return speed;
+    }
+
 protected:
     /**
      * @brief URB 完成时的响应出口
